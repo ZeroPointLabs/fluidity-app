@@ -1,0 +1,12 @@
+
+FROM fluidity/build-container:latest
+
+WORKDIR /usr/local/src/fluidity/tests/pipeline
+
+COPY . .
+
+ENTRYPOINT [ \
+	"wait-for-amqp", \
+	"wait-for-database.sh", \
+	"./run-specific-test.sh" \
+]

@@ -1,0 +1,55 @@
+version: '3.4'
+
+x-flu-envs: &flu-envs
+  FLU_DEBUG: true
+  FLU_WORKER_ID: spooler
+  FLU_AMQP_QUEUE_ADDR: amqp://rabbit
+  FLU_POSTGRES_URI: postgresql://fluidity:fluidity@postgres:5432?sslmode=disable
+  FLU_TIMESCALE_URI: postgresql://fluidity:fluidity@timescale:5432?sslmode=disable
+  FLU_REDIS_ADDR: redis:6379
+
+services:
+  rabbit:
+    image: rabbitmq
+  redis:
+    image: redis
+  postgres:
+    build:
+      context: ../../database
+      dockerfile: Dockerfile.postgres
+    environment:
+      - POSTGRES_USER=fluidity
+      - POSTGRES_PASSWORD=fluidity
+  timescale:
+    build:
+      context: ../../database
+      dockerfile: Dockerfile.timescale
+    environment:
+      - POSTGRES_USER=fluidity
+      - POSTGRES_PASSWORD=fluidity
+
+  spooler:
+    build:
+      context: ../../cmd/microservice-ethereum-worker-spooler/
+    environment:
+      <<: *flu-envs
+      FLU_ETHEREUM_WINNERS_AMQP_QUEUE_NAME: spooler.in
+      FLU_ETHEREUM_BATCHED_WINNERS_AMQP_QUEUE_NAME: spooler.out
+      FLU_ETHEREUM_NETWORK: ethereum
+
+  test-spooler:
+    build:
+      context: .
+      dockerfile: Dockerfile.tests
+    depends_on:
+      - rabbit
+      - redis
+      - postgres
+      - timescale
+      - spooler
+    environment:
+      FLU_TEST: TestSpooler
+      <<: *flu-envs
+      FLU_ETHEREUM_WINNERS_AMQP_QUEUE_NAME: spooler.in
+      FLU_ETHEREUM_BATCHED_WINNERS_AMQP_QUEUE_NAME: spooler.out
+      FLU_ETHEREUM_NETWORK: ethereum
