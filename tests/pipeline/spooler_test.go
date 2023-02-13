@@ -1,12 +1,10 @@
 package main_test
 
 import (
+	"math"
 	"math/big"
-	"math/rand"
 	"testing"
 
-	"github.com/ethereum/go-ethereum/common"
-	"github.com/fluidity-money/fluidity-app/common/ethereum"
 	"github.com/fluidity-money/fluidity-app/lib/databases/postgres/worker"
 	"github.com/fluidity-money/fluidity-app/lib/queue"
 	"github.com/fluidity-money/fluidity-app/lib/types/applications"
@@ -47,7 +45,7 @@ func (w *winnerGenerator) generateWinnerAnnouncement(from, to ethTypes.Address, 
 
     return workerTypes.EthereumWinnerAnnouncement{
     	Network:         w.network,
-    	TransactionHash: randomHash(),
+    	TransactionHash: libtest.RandomHash(),
     	BlockNumber:     &blockNumInt,
     	FromAddress:     from,
     	ToAddress:       to,
@@ -58,27 +56,29 @@ func (w *winnerGenerator) generateWinnerAnnouncement(from, to ethTypes.Address, 
     }
 }
 
-func generateWinnings(token token_details.TokenDetails, usd float64, exchangeRate *big.Rat) workerTypes.Payout {
-    return workerTypes.Payout{
-    	Native: misc.BigInt{},
+func generateWinnings(token token_details.TokenDetails, usd float64, exchangeRate *big.Rat) (workerTypes.Payout, map[applications.UtilityName]workerTypes.Payout) {
+    decimals := token.TokenDecimals
+
+    usdRat := new(big.Rat).SetFloat64(usd)
+    nativeRat := new(big.Rat).Quo(usdRat, exchangeRate)
+
+    nativeInt := new(big.Int)
+    // 1e(decimals)
+    nativeInt.Exp(big.NewInt(10), big.NewInt(int64(decimals)), nil)
+    // 1e(decimals) * num/denom
+    nativeInt.Mul(nativeInt, nativeRat.Num())
+    nativeInt.Quo(nativeInt, nativeRat.Denom())
+
+    payout := workerTypes.Payout{
+    	Native: misc.NewBigIntFromInt(*nativeInt),
     	Usd:    usd,
     }
-}
 
-func randomHash() ethTypes.Hash {
-    hash := common.Hash{}
+    payoutMap := map[applications.UtilityName]workerTypes.Payout{
+        applications.UtilityFluid: payout,
+    }
 
-    rand.Read(hash[:])
-
-    return ethereum.ConvertGethHash(hash)
-}
-
-func randomAddress() ethTypes.Address {
-    address := common.Address{}
-
-    rand.Read(address[:])
-
-    return ethereum.ConvertGethAddress(address)
+    return payout, payoutMap
 }
 
 func TestSpooler(t *testing.T) {
@@ -93,8 +93,7 @@ func TestSpooler(t *testing.T) {
         config = worker.GetWorkerConfigEthereum(Network)
 
         instantRewardThreshold = config.SpoolerInstantRewardThreshold
-        //batchRewardThreshold   = config.SpoolerBatchedRewardThreshold
-
+        batchRewardThreshold   = config.SpoolerBatchedRewardThreshold
     )
 
     token := token_details.New("fTest", 6)
@@ -106,20 +105,13 @@ func TestSpooler(t *testing.T) {
     }
 
     var (
-        from = randomAddress()
-        to   = randomAddress()
+        from = libtest.RandomAddress()
+        to   = libtest.RandomAddress()
 
         // 80%
-        fromWinnings = generateWinnings(token, instantRewardThreshold, big.NewRat(1, 1))
+        fromWinnings, fromWinningsMap = generateWinnings(token, instantRewardThreshold, big.NewRat(1, 1))
         // 20%
-        toWinnings = generateWinnings(token, instantRewardThreshold/4, big.NewRat(1, 1))
-
-        fromWinningsMap = map[applications.UtilityName]workerTypes.Payout{
-            applications.UtilityFluid: fromWinnings,
-        }
-        toWinningsMap = map[applications.UtilityName]workerTypes.Payout{
-            applications.UtilityFluid: toWinnings,
-        }
+        toWinnings, toWinningsMap = generateWinnings(token, instantRewardThreshold/4, big.NewRat(1, 1))
     )
 
     winning := generator.generateWinnerAnnouncement(
@@ -152,6 +144,63 @@ func TestSpooler(t *testing.T) {
     fromReward := fluidReward[from]
     toReward := fluidReward[to]
 
-    assert.Equal(t, fromReward, fromWinnings)
-    assert.Equal(t, toReward, toWinnings)
+    assert.Equal(t, fromReward, fromWinnings.Native)
+    assert.Equal(t, toReward, toWinnings.Native)
+
+    // now try a batch payout
+
+    batchAmount := math.Min(instantRewardThreshold, batchRewardThreshold) * 0.9
+
+    rewardsNeeded := math.Ceil(batchRewardThreshold / batchAmount)
+
+    totalRewardAmount := batchAmount * rewardsNeeded
+
+    for i := 0; i < int(rewardsNeeded); i++ {
+        var (
+            from = libtest.RandomAddress()
+            to   = libtest.RandomAddress()
+
+            // 80%
+            _, fromWinningsMap = generateWinnings(token, batchAmount*4/5, big.NewRat(1, 1))
+            // 20%
+            _, toWinningsMap = generateWinnings(token, batchAmount*1/5, big.NewRat(1, 1))
+        )
+
+        winning := generator.generateWinnerAnnouncement(
+            from,
+            to,
+            fromWinningsMap,
+            toWinningsMap,
+        )
+        winnings := []workerTypes.EthereumWinnerAnnouncement { winning }
+
+        // this should result in an instant payout
+        queue.SendMessage(spoolerInputQueue, winnings)
+    }
+
+    // we should have rewards now!
+    err = logger.GetMessage(&spooledWinnings)
+
+    assert.Nil(t, err)
+
+    assert.Equal(t, Network, spooledWinnings.Network)
+    assert.Equal(t, token, spooledWinnings.Token)
+
+    nativePayout := new(misc.BigInt)
+    expectedPayout, _ := generateWinnings(token, totalRewardAmount, big.NewRat(1, 1))
+
+    for utility, rewardsMap := range spooledWinnings.Rewards {
+        for _, payout := range rewardsMap {
+            assert.Equal(t, applications.UtilityFluid, utility)
+            nativePayout.Add(&nativePayout.Int, &payout.Int)
+        }
+    }
+
+    assert.Equal(t, expectedPayout.Native, *nativePayout)
+
+    // make sure we don't have any stray winnings
+
+    err = logger.GetMessage(&spooledWinnings)
+
+    assert.Equal(t, libtest.ErrNoMessages, err)
 }

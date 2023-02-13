@@ -16,6 +16,10 @@ const (
     DefaultTimeout = 5
 )
 
+var (
+    ErrNoMessages = fmt.Errorf("No message after waiting %d seconds!", DefaultTimeout)
+)
+
 func (r *Logger) GetMessage(into interface{}) error {
     select {
     case msg := <-r.msgChan:
@@ -23,7 +27,7 @@ func (r *Logger) GetMessage(into interface{}) error {
         return nil
 
     case <-time.After(time.Second * DefaultTimeout):
-        return fmt.Errorf("No message after waiting %d seconds!", DefaultTimeout)
+        return ErrNoMessages
     }
 }
 
